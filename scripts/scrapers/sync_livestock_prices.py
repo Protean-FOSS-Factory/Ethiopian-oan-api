@@ -32,9 +32,9 @@ logger = get_logger(__name__)
 
 async def fetch_livestock_prices(marketplace_id: int):
     """Fetch current livestock prices for a specific marketplace"""
-    url = f"http://nmis.et/api/web-livestock/getCurrentMarketData/{marketplace_id}/en"
+    url = f"https://nmis.et/api/web-livestock/getCurrentMarketData/{marketplace_id}/en"
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         try:
             response = await client.get(url)
             if response.status_code == 200:
@@ -50,15 +50,15 @@ async def upsert_livestock_price(db, marketplace_id: int, price_data_list: list)
     try:
         # Group by (livestock_name, breed_name) - these should all be the same
         first_item = price_data_list[0]
-        livestock_name = first_item.get("cName")
+        livestock_name = first_item.get("cName", "").strip()  # Strip whitespace!
         breed_name = first_item.get("varietyName", "").strip() if first_item.get("varietyName") else None
 
         if not livestock_name:
             raise ValueError("cName (livestock name) is required")
 
-        # Find livestock by name
+        # Find livestock by name - use case-insensitive matching
         livestock_result = await db.execute(
-            select(Livestock).where(Livestock.name == livestock_name)
+            select(Livestock).where(Livestock.name.ilike(livestock_name))
         )
         livestock = livestock_result.scalar_one_or_none()
 
@@ -87,8 +87,9 @@ async def upsert_livestock_price(db, marketplace_id: int, price_data_list: list)
         variations = []
 
         for item in price_data_list:
-            pmin = item.get("pmin", 0) or 0
-            pmax = item.get("pmax", 0) or 0
+            # Convert to float to handle both string and numeric values
+            pmin = float(item.get("pmin", 0) or 0)
+            pmax = float(item.get("pmax", 0) or 0)
 
             if pmin > 0:
                 all_mins.append(pmin)
@@ -161,12 +162,12 @@ async def upsert_livestock_price(db, marketplace_id: int, price_data_list: list)
             db.add(price)
             action = "inserted"
 
-        await db.commit()
+        await db.flush()  # Use flush instead of commit - commit will be called by caller
         return {"action": action, "livestock_name": livestock_name, "breed_name": breed_name, "variation_count": len(variations)}
 
     except Exception as e:
-        await db.rollback()
-        raise
+        logger.error(f"Error processing livestock price: {str(e)}")
+        return {"action": "error", "livestock_name": None, "breed_name": None, "error": str(e)}
 
 
 async def sync_livestock_prices():
@@ -194,12 +195,16 @@ async def sync_livestock_prices():
 
             for i, marketplace in enumerate(marketplaces, 1):
                 try:
+                    # Extract marketplace info early to avoid lazy loading issues
+                    marketplace_id = marketplace.marketplace_id
+                    marketplace_name = marketplace.name
+                    
                     # Fetch prices for this marketplace
-                    prices = await fetch_livestock_prices(marketplace.marketplace_id)
+                    prices = await fetch_livestock_prices(marketplace_id)
 
                     if prices:
                         stats["marketplaces_with_prices"] += 1
-                        print(f"\n[{i}/{len(marketplaces)}] {marketplace.name}")
+                        print(f"\n[{i}/{len(marketplaces)}] {marketplace_name}")
                         print(f"  Found {len(prices)} livestock price entries")
 
                         # Group prices by (livestock_name, breed_name) to aggregate variations
@@ -215,7 +220,7 @@ async def sync_livestock_prices():
                         for (livestock_name, breed_name), price_list in grouped_prices.items():
                             try:
                                 # Insert/update aggregated price
-                                result = await upsert_livestock_price(db, marketplace.marketplace_id, price_list)
+                                result = await upsert_livestock_price(db, marketplace_id, price_list)
 
                                 if result["action"] == "inserted":
                                     stats["prices_inserted"] += 1
@@ -231,6 +236,9 @@ async def sync_livestock_prices():
                                 stats["errors"] += 1
                                 logger.error(f"Error processing price {livestock_name}: {e}")
 
+                        # Commit all changes after processing all items for this marketplace
+                        await db.commit()
+
                     else:
                         stats["marketplaces_without_prices"] += 1
 
@@ -238,7 +246,7 @@ async def sync_livestock_prices():
 
                 except Exception as e:
                     stats["errors"] += 1
-                    logger.error(f"Error for marketplace {marketplace.name}: {e}")
+                    logger.error(f"Error for marketplace {marketplace_name if 'marketplace_name' in locals() else 'unknown'}: {e}")
 
             print("\n" + "=" * 80)
             logger.info("✓ Livestock prices sync complete!")

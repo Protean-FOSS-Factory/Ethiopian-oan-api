@@ -6,8 +6,12 @@ from sqlalchemy import func, select, or_
 from typing import List, Optional, Tuple
 from sqlalchemy.orm import joinedload
 from helpers.utils import get_logger
+from app.core.cache import cache
 
 logger = get_logger(__name__)
+
+CACHE_TTL_PRICE = 900  # 15 minutes
+CACHE_TTL_LIST = 3600  # 1 hour
 
 
 async def _get_marketplace(
@@ -74,6 +78,13 @@ async def list_livestock_in_marketplace(
     """
     logger.info(f"list_livestock_in_marketplace: marketplace={marketplace_name}, region={region}")
 
+    # Check cache
+    cache_key = f"livestock:list:{marketplace_name}:{region or 'none'}"
+    cached_data = await cache.get(cache_key)
+    if cached_data:
+        logger.info(f"Cache HIT for livestock list: {cache_key}")
+        return cached_data
+
     async with async_session_maker() as db:
         marketplace, error = await _get_marketplace(db, marketplace_name, region)
         if error:
@@ -102,10 +113,14 @@ async def list_livestock_in_marketplace(
             for livestock in livestocks
         ]
 
-        return (
+        result_str = (
             f"Livestock available in {marketplace.name} ({marketplace.region}):\n\n" +
             "\n".join(livestock_list)
         )
+        
+        # Cache result
+        await cache.set(cache_key, result_str, ttl=CACHE_TTL_LIST)
+        return result_str
 
 
 async def get_livestock_price_in_marketplace(
@@ -130,6 +145,13 @@ async def get_livestock_price_in_marketplace(
     """
     logger.info(f"get_livestock_price_in_marketplace: livestock={livestock_type}, marketplace={marketplace_name}, region={region}")
 
+    # Check cache
+    cache_key = f"livestock:price:full:{livestock_type}:{marketplace_name}:{region or 'none'}"
+    cached_data = await cache.get(cache_key)
+    if cached_data:
+        logger.info(f"Cache HIT for livestock price (full): {cache_key}")
+        return cached_data
+
     async with async_session_maker() as db:
         marketplace, error = await _get_marketplace(db, marketplace_name, region)
         if error:
@@ -143,6 +165,7 @@ async def get_livestock_price_in_marketplace(
                 MarketPrice.modal_price,
                 MarketPrice.price_date,
                 MarketPrice.unit,
+                MarketPrice.meta_data,
                 Livestock.name_amharic.label('livestock_name_amharic'),
                 Livestock.name.label('livestock_name'),
                 LivestockBreed.name.label('breed_name'),
@@ -171,18 +194,66 @@ async def get_livestock_price_in_marketplace(
         price_data_breeds = {}
         for price_row in price_data_list:
             breed_key = price_row.breed_name or "Default"
-            price_data_breeds[breed_key] = (
-                f"{price_row.livestock_name} ({price_row.livestock_name_amharic}) prices in {marketplace.name}:\n\n"
-                f"* Breed: {price_row.breed_name or 'N/A'}" +
-                (f" ({price_row.breed_name_amharic})" if price_row.breed_name_amharic else "") + "\n"
-                f"* Min Price: {price_row.min_price or 'N/A'} ETB/{price_row.unit or 'Head'}\n"
-                f"* Max Price: {price_row.max_price or 'N/A'} ETB/{price_row.unit or 'Head'}\n"
-                f"* Avg Price: {price_row.avg_price or 'N/A'} ETB/{price_row.unit or 'Head'}\n"
-                f"* Date: {price_row.price_date.strftime('%Y-%m-%d')}\n"
-                f"* Source: https://nmis.et/"
-            )
 
-        return "\n\n".join(price_data_breeds.values())
+            # Build variations info from meta_data
+            variations_info = ""
+            if price_row.meta_data and price_row.meta_data.get("variations"):
+                variations = price_row.meta_data["variations"]
+                var_details = []
+                for var in variations:
+                    parts = []
+                    if var.get("gender"):
+                        parts.append(var["gender"])
+                    if var.get("age"):
+                        parts.append(var["age"])
+                    if var.get("grade"):
+                        parts.append(f"Grade: {var['grade']}")
+                    if var.get("productionType"):
+                        parts.append(f"Type: {var['productionType']}")
+                    if var.get("location"):
+                        parts.append(f"From: {var['location']}")
+
+                    price_range = ""
+                    if var.get("pmin") and var.get("pmax"):
+                        price_range = f" ({var['pmin']}-{var['pmax']} ETB)"
+                    elif var.get("pmin"):
+                        price_range = f" ({var['pmin']} ETB)"
+                    elif var.get("pmax"):
+                        price_range = f" ({var['pmax']} ETB)"
+
+                    if parts:
+                        var_details.append(f"  - {', '.join(parts)}{price_range}")
+
+                if var_details:
+                    variations_info = "\n* Variations:\n" + "\n".join(var_details)
+
+            if variations_info:
+                price_data_breeds[breed_key] = (
+                    f"{price_row.livestock_name} ({price_row.livestock_name_amharic}) prices in {marketplace.name}:\n\n"
+                    f"* Breed: {price_row.breed_name or 'N/A'}" +
+                    (f" ({price_row.breed_name_amharic})" if price_row.breed_name_amharic else "") + "\n"
+                    f"{variations_info}\n"
+                    f"* As of Date: {price_row.price_date.strftime('%Y-%m-%d')}"
+                    f"* Source: https://nmis.et/"
+                )
+            else:
+                price_data_breeds[breed_key] = (
+                    f"{price_row.livestock_name} ({price_row.livestock_name_amharic}) prices in {marketplace.name}:\n\n"
+                    f"* Breed: {price_row.breed_name or 'N/A'}" +
+                    (f" ({price_row.breed_name_amharic})" if price_row.breed_name_amharic else "") + "\n"
+                    f"* Min Price: {price_row.min_price or 'N/A'} ETB\n"
+                    f"* Max Price: {price_row.max_price or 'N/A'} ETB\n"
+                    f"* Avg Price: {price_row.avg_price or 'N/A'} ETB\n"
+                    f"* As of Date: {price_row.price_date.strftime('%Y-%m-%d')}"
+                    f"{variations_info}\n"
+                    f"* Source: https://nmis.et/"
+                )
+
+        result_str = "\n\n".join(price_data_breeds.values())
+        
+        # Cache result
+        await cache.set(cache_key, result_str, ttl=CACHE_TTL_PRICE)
+        return result_str
 
 
 async def compare_livestock_prices_nearby(
@@ -215,6 +286,7 @@ async def compare_livestock_prices_nearby(
                 MarketPrice.avg_price,
                 MarketPrice.price_date,
                 MarketPrice.unit,
+                MarketPrice.meta_data,
                 Livestock.name.label('livestock_name'),
                 LivestockBreed.name.label('breed_name')
             )
@@ -249,13 +321,52 @@ async def compare_livestock_prices_nearby(
         lines = [f"{livestock_type} price comparison:\n"]
 
         for idx, market in enumerate(markets, 1):
-            lines.append(
-                f"{idx}. **{market.name}** ({market.region})\n"
-                f"   * Avg: {market.avg_price} ETB/{market.unit or 'Head'}\n"
-                f"   * Range: {market.min_price} - {market.max_price} ETB\n"
-                f"   * Date: {market.price_date.strftime('%Y-%m-%d')}\n"
-                f"   * Source: https://nmis.et/"
-            )
+            # Build variations info from meta_data
+            variations_info = ""
+            if market.meta_data and market.meta_data.get("variations"):
+                variations = market.meta_data["variations"]
+                var_details = []
+                for var in variations:
+                    parts = []
+                    if var.get("gender"):
+                        parts.append(var["gender"])
+                    if var.get("age"):
+                        parts.append(var["age"])
+                    if var.get("grade"):
+                        parts.append(f"Grade: {var['grade']}")
+                    if var.get("productionType"):
+                        parts.append(f"Type: {var['productionType']}")
+
+                    price_range = ""
+                    if var.get("pmin") and var.get("pmax"):
+                        price_range = f" ({var['pmin']}-{var['pmax']} ETB)"
+                    elif var.get("pmin"):
+                        price_range = f" ({var['pmin']} ETB)"
+                    elif var.get("pmax"):
+                        price_range = f" ({var['pmax']} ETB)"
+
+                    if parts:
+                        var_details.append(f"     - {', '.join(parts)}{price_range}")
+
+                if var_details:
+                    variations_info = "\n   * Variations:\n" + "\n".join(var_details)
+
+            if variations_info:
+                lines.append(
+                    f"{idx}. **{market.name}** ({market.region})\n"
+                    f"{variations_info}\n"
+                    f"   * As of Date: {market.price_date.strftime('%Y-%m-%d')}"
+                    f"   * Source: https://nmis.et/"
+                )
+            else:
+                lines.append(
+                    f"{idx}. **{market.name}** ({market.region})\n"
+                    f"   * Avg: {market.avg_price} ETB\n"
+                    f"   * Range: {market.min_price} - {market.max_price} ETB\n"
+                    f"   * As of Date: {market.price_date.strftime('%Y-%m-%d')}"
+                    f"{variations_info}\n"
+                    f"   * Source: https://nmis.et/"
+                )
 
         return "\n\n".join(lines)
 
@@ -283,9 +394,15 @@ async def get_livestock_price_quick(
                          Must be explicitly mentioned by user, not assumed.
     
     Returns:
-        Price information or error message if marketplace/livestock not found
     """
     logger.info(f"get_livestock_price_quick: livestock={livestock_type}, marketplace={marketplace_name}")
+    
+    # Check cache
+    cache_key = f"livestock:price:quick:{livestock_type}:{marketplace_name}"
+    cached_data = await cache.get(cache_key)
+    if cached_data:
+        logger.info(f"Cache HIT for livestock price (quick): {cache_key}")
+        return cached_data
     
     # Validate parameters - check for vague/generic inputs
     vague_terms = ['livestock', 'animal', 'it', 'that', 'this', 'something', 'anything', 'price', 'market', 'the market']
@@ -293,7 +410,7 @@ async def get_livestock_price_quick(
     livestock_lower = livestock_type.lower().strip()
     market_lower = marketplace_name.lower().strip()
     
-    if livestock_lower in vague_terms or len(livestock_lower) < 3:
+    if livestock_lower in vague_terms or len(livestock_lower) < 2:
         return "ERROR: I need to know which specific livestock type you're asking about. Please tell me the livestock type (e.g., cattle, goat, sheep, oxen)."
     
     if market_lower in vague_terms or len(market_lower) < 3:
@@ -303,7 +420,7 @@ async def get_livestock_price_quick(
     livestock_normalized = livestock_lower
     plural_to_singular = {
         'oxen': 'ox',
-        'cattle': 'cow',  
+        # 'cattle': 'cow',  <-- Removed to force clarification
         'sheep': 'sheep',  
         'goats': 'goat',
         'camels': 'camel',
@@ -327,32 +444,46 @@ async def get_livestock_price_quick(
     # Try exact match first
     marketplace_info = EXACT_MATCH_UP_LIVESTOCK_MARKETPLACES.get(marketplace_name)
     
-    # If not found, try case-insensitive exact match
+    # If not found, try fuzzy matching with difflib
     if not marketplace_info:
-        for key, value in EXACT_MATCH_UP_LIVESTOCK_MARKETPLACES.items():
-            key_lower = key.lower()
-            key_clean = key_lower.replace(" market", "").replace(" gebeya", "").replace(" city", "").strip()
+        import difflib
+        
+        # Create a mapping of clean names to original keys for better matching
+        # key_map maps lowercase clean name -> original key
+        key_map = {}
+        all_keys = []
+        
+        for key in EXACT_MATCH_UP_LIVESTOCK_MARKETPLACES.keys():
+            all_keys.append(key)
+            # Add cleaned versions to improve matching chances
+            key_clean = key.lower().replace(" market", "").replace(" gebeya", "").replace(" city", "").strip()
+            if key_clean not in key_map:
+                key_map[key_clean] = key
+        
+        # 1. Try matching against the full keys
+        matches = difflib.get_close_matches(name_lower, [k.lower() for k in all_keys], n=1, cutoff=0.7)
+        
+        if matches:
+            # Find the original key that matches this lowercase match
+            matched_lower = matches[0]
+            for key in all_keys:
+                if key.lower() == matched_lower:
+                    marketplace_name = key
+                    marketplace_info = EXACT_MATCH_UP_LIVESTOCK_MARKETPLACES[key]
+                    logger.info(f"Fuzzy matched '{name_lower}' to '{key}' (score via direct match)")
+                    break
+        
+        # 2. If no match yet, try matching against cleaned names (often better for user inputs)
+        if not marketplace_info:
+            clean_input = name_lower.replace(" market", "").replace(" gebeya", "").replace(" city", "").strip()
+            clean_matches = difflib.get_close_matches(clean_input, list(key_map.keys()), n=1, cutoff=0.6)
             
-            # Exact match (case-insensitive)
-            if key_lower == name_lower or key_clean == clean_name:
-                marketplace_info = value
-                marketplace_name = key  
-                break
-    
-    # If still not found, try partial matching (e.g., "Dubti" matches "Dubti Market")
-    if not marketplace_info:
-        for key, value in EXACT_MATCH_UP_LIVESTOCK_MARKETPLACES.items():
-            key_lower = key.lower()
-            key_clean = key_lower.replace(" market", "").replace(" gebeya", "").replace(" city", "").strip()
-            
-            # Check if the search term is contained in the marketplace name
-            # or if the marketplace name starts with the search term
-            if (clean_name in key_clean or key_clean.startswith(clean_name) or 
-                clean_name.startswith(key_clean)):
-                marketplace_info = value
-                marketplace_name = key 
-                logger.info(f"Fuzzy matched '{marketplace_name}' to '{key}'")
-                break
+            if clean_matches:
+                best_clean_match = clean_matches[0]
+                original_key = key_map[best_clean_match]
+                marketplace_name = original_key
+                marketplace_info = EXACT_MATCH_UP_LIVESTOCK_MARKETPLACES[original_key]
+                logger.info(f"Fuzzy matched '{clean_input}' to '{original_key}' (via clean name)")
     
     if not marketplace_info:
         logger.info(f"get_livestock_price_quick: marketplace not found")
@@ -378,6 +509,7 @@ async def get_livestock_price_quick(
                 MarketPrice.modal_price,
                 MarketPrice.price_date,
                 MarketPrice.unit,
+                MarketPrice.meta_data,
                 Livestock.name_amharic.label('livestock_name_amharic'),
                 Livestock.name.label('livestock_name'),
                 LivestockBreed.name.label('breed_name'),
@@ -407,19 +539,67 @@ async def get_livestock_price_quick(
         price_data_breeds = {}
         for price_row in price_data_list:
             breed_key = price_row.breed_name or "Default"
-            price_data_breeds[breed_key] = (
-                f"{price_row.livestock_name} ({price_row.livestock_name_amharic}) prices in {marketplace_name} ({region}):\n\n"
-                f"* Breed: {price_row.breed_name or 'N/A'}" +
-                (f" ({price_row.breed_name_amharic})" if price_row.breed_name_amharic else "") + "\n"
-                f"* Min Price: {price_row.min_price or 'N/A'} ETB/{price_row.unit or 'Head'}\n"
-                f"* Max Price: {price_row.max_price or 'N/A'} ETB/{price_row.unit or 'Head'}\n"
-                f"* Avg Price: {price_row.avg_price or 'N/A'} ETB/{price_row.unit or 'Head'}\n"
-                f"* Modal Price: {price_row.modal_price or 'N/A'} ETB/{price_row.unit or 'Head'}\n"
-                f"* Date: {price_row.price_date.strftime('%Y-%m-%d')}\n"
-                f"* Source: https://nmis.et/"
-            )
+
+            # Build variations info from meta_data
+            variations_info = ""
+            if price_row.meta_data and price_row.meta_data.get("variations"):
+                variations = price_row.meta_data["variations"]
+                var_details = []
+                for var in variations:
+                    parts = []
+                    if var.get("gender"):
+                        parts.append(var["gender"])
+                    if var.get("age"):
+                        parts.append(var["age"])
+                    if var.get("grade"):
+                        parts.append(f"Grade: {var['grade']}")
+                    if var.get("productionType"):
+                        parts.append(f"Type: {var['productionType']}")
+                    if var.get("location"):
+                        parts.append(f"From: {var['location']}")
+
+                    price_range = ""
+                    if var.get("pmin") and var.get("pmax"):
+                        price_range = f" ({var['pmin']}-{var['pmax']} ETB)"
+                    elif var.get("pmin"):
+                        price_range = f" ({var['pmin']} ETB)"
+                    elif var.get("pmax"):
+                        price_range = f" ({var['pmax']} ETB)"
+
+                    if parts:
+                        var_details.append(f"  - {', '.join(parts)}{price_range}")
+
+                if var_details:
+                    variations_info = "\n* Variations:\n" + "\n".join(var_details)
+
+            if variations_info:
+                price_data_breeds[breed_key] = (
+                    f"{price_row.livestock_name} ({price_row.livestock_name_amharic}) prices in {marketplace_name} ({region}):\n\n"
+                    f"* Breed: {price_row.breed_name or 'N/A'}" +
+                    (f" ({price_row.breed_name_amharic})" if price_row.breed_name_amharic else "") + "\n"
+                    f"{variations_info}\n"
+                    f"* As of Date: {price_row.price_date.strftime('%Y-%m-%d')}\n"
+                    f"* Source: https://nmis.et/"
+                )
+            else:
+                price_data_breeds[breed_key] = (
+                    f"{price_row.livestock_name} ({price_row.livestock_name_amharic}) prices in {marketplace_name} ({region}):\n\n"
+                    f"* Breed: {price_row.breed_name or 'N/A'}" +
+                    (f" ({price_row.breed_name_amharic})" if price_row.breed_name_amharic else "") + "\n"
+                    f"* Min Price: {price_row.min_price or 'N/A'} ETB\n"
+                    f"* Max Price: {price_row.max_price or 'N/A'} ETB\n"
+                    f"* Avg Price: {price_row.avg_price or 'N/A'} ETB\n"
+                    f"* Modal Price: {price_row.modal_price or 'N/A'} ETB\n"
+                    f"* As of Date: {price_row.price_date.strftime('%Y-%m-%d')}"
+                    f"{variations_info}\n"
+                    f"* Source: https://nmis.et/"
+                )
         
         logger.info(f"get_livestock_price_quick: found {len(price_data_breeds)} breeds")
         
         # Format response
-        return "\n\n".join(price_data_breeds.values())
+        result_str = "\n\n".join(price_data_breeds.values())
+        
+        # Cache result
+        await cache.set(cache_key, result_str, ttl=CACHE_TTL_PRICE)
+        return result_str

@@ -25,10 +25,10 @@ logger = get_logger(__name__)
 
 async def fetch_marketplace_livestock(marketplace_id: int):
     """Fetch livestock data including varieties for a specific marketplace in both English and Amharic"""
-    url_en = f"http://nmis.et/api/web-livestock/getCurrentMarketData/{marketplace_id}/en"
-    url_am = f"http://nmis.et/api/web-livestock/getCurrentMarketData/{marketplace_id}/am"
+    url_en = f"https://nmis.et/api/web-livestock/getCurrentMarketData/{marketplace_id}/en"
+    url_am = f"https://nmis.et/api/web-livestock/getCurrentMarketData/{marketplace_id}/am"
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         try:
             # Fetch both languages
             response_en = await client.get(url_en)
@@ -114,7 +114,7 @@ async def upsert_variety(db, variety_data: Dict[str, Any]) -> Dict[str, Any]:
             action = "inserted"
             variety_id = variety.breed_id
 
-        await db.commit()
+        await db.flush()  # Use flush instead of commit - commit will be called by caller
         return {
             "action": action,
             "variety_id": variety_id,
@@ -123,8 +123,8 @@ async def upsert_variety(db, variety_data: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        await db.rollback()
-        raise
+        logger.error(f"Error processing livestock variety : {str(e)}")
+        return {"action": "error", "variety_name": None, "error": str(e)}
 
 
 async def sync_varieties():
@@ -152,11 +152,15 @@ async def sync_varieties():
 
             for i, marketplace in enumerate(marketplaces, 1):
                 try:
+                    # Extract marketplace info early to avoid lazy loading issues
+                    marketplace_id = marketplace.marketplace_id
+                    marketplace_name = marketplace.name
+                    
                     # Fetch livestock with varieties for this marketplace
-                    livestock_data_list = await fetch_marketplace_livestock(marketplace.marketplace_id)
+                    livestock_data_list = await fetch_marketplace_livestock(marketplace_id)
 
                     if livestock_data_list:
-                        print(f"\n[{i}/{len(marketplaces)}] {marketplace.name}")
+                        print(f"\n[{i}/{len(marketplaces)}] {marketplace_name}")
                         print(f"  Found {len(livestock_data_list)} livestock items")
 
                         for livestock_data in livestock_data_list:
@@ -188,10 +192,13 @@ async def sync_varieties():
                                 stats["errors"] += 1
                                 logger.error(f"Error processing variety {variety_name}: {e}")
 
+                        # Commit all changes after processing all items for this marketplace
+                        await db.commit()
+
                     stats["marketplaces_processed"] += 1
 
                 except Exception as e:
-                    logger.error(f"Error for marketplace {marketplace.name}: {e}")
+                    logger.error(f"Error for marketplace {marketplace_name if 'marketplace_name' in locals() else 'unknown'}: {e}")
 
             print("\n" + "=" * 80)
             logger.info("✓ Livestock varieties sync complete!")
