@@ -59,8 +59,8 @@ async def run_all():
     logger.info("Starting all data scrapers")
     logger.info("=" * 60)
 
-    # Clear prices table first
-    await clear_prices()
+    # NOTE: Removed clear_prices() call - individual scrapers do safe upserts
+    # Wiping the table on every startup caused queries to fail during the ~10min sync window
 
     scrapers = [
         ("marketplaces", "scripts.scrapers.sync_marketplaces"),
@@ -70,6 +70,8 @@ async def run_all():
         ("livestock_varieties", "scripts.scrapers.sync_livestock_varieties"),
         ("crop_prices", "scripts.scrapers.sync_crop_prices"),
         ("livestock_prices", "scripts.scrapers.sync_livestock_prices"),
+        ("crop_prices_collected_at", "scripts.scrapers.sync_crop_prices_table"),
+        ("livestock_prices_collected_at", "scripts.scrapers.sync_livestock_prices_table"),
     ]
 
     results = {}

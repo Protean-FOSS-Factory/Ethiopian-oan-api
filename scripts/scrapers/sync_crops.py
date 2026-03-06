@@ -27,10 +27,10 @@ logger = get_logger(__name__)
 
 async def fetch_marketplace_crops(marketplace_id: int):
     """Fetch crop data for a specific marketplace in both English and Amharic"""
-    url_en = f"http://nmis.et/api/web/getMarketCrop/{marketplace_id}/en"
-    url_am = f"http://nmis.et/api/web/getMarketCrop/{marketplace_id}/am"
+    url_en = f"https://nmis.et/api/web/getMarketCrop/{marketplace_id}/en"
+    url_am = f"https://nmis.et/api/web/getMarketCrop/{marketplace_id}/am"
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         try:
             # Fetch both languages
             response_en = await client.get(url_en)
@@ -94,12 +94,12 @@ async def upsert_crop(db, crop_data: Dict[str, Any]) -> Dict[str, Any]:
             action = "inserted"
             crop_id = crop.crop_id
 
-        await db.commit()
+        await db.flush()  # Use flush instead of commit - commit will be called by caller
         return {"action": action, "crop_id": crop_id, "crop_name": crop_name}
 
     except Exception as e:
-        await db.rollback()
-        raise
+        logger.error(f"Error processing crop : {str(e)}")
+        return {"action": "error", "crop_name": None, "error": str(e)}
 
 
 async def sync_crops():
@@ -127,11 +127,15 @@ async def sync_crops():
 
             for i, marketplace in enumerate(marketplaces, 1):
                 try:
+                    # Extract marketplace info early to avoid lazy loading issues
+                    marketplace_id = marketplace.marketplace_id
+                    marketplace_name = marketplace.name
+                    
                     # Fetch crops for this marketplace
-                    crop_data_list = await fetch_marketplace_crops(marketplace.marketplace_id)
+                    crop_data_list = await fetch_marketplace_crops(marketplace_id)
 
                     if crop_data_list:
-                        print(f"\n[{i}/{len(marketplaces)}] {marketplace.name}")
+                        print(f"\n[{i}/{len(marketplaces)}] {marketplace_name}")
                         print(f"  Found {len(crop_data_list)} items")
 
                         for crop_data in crop_data_list:
@@ -156,10 +160,13 @@ async def sync_crops():
                                 stats["errors"] += 1
                                 logger.error(f"Error processing crop {crop_name}: {e}")
 
+                        # Commit all changes after processing all items for this marketplace
+                        await db.commit()
+
                     stats["marketplaces_processed"] += 1
 
                 except Exception as e:
-                    logger.error(f"Error for marketplace {marketplace.name}: {e}")
+                    logger.error(f"Error for marketplace {marketplace_name if 'marketplace_name' in locals() else 'unknown'}: {e}")
 
             print("\n" + "=" * 80)
             logger.info("✓ Crop sync complete!")

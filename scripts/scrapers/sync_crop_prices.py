@@ -27,9 +27,9 @@ logger = get_logger(__name__)
 
 async def fetch_marketplace_crops(marketplace_id: int):
     """Fetch crop price data for a specific marketplace"""
-    url = f"http://nmis.et/api/web/getCurrentMarketData/{marketplace_id}/en"
+    url = f"https://nmis.et/api/web/getCurrentMarketData/{marketplace_id}/en"
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         try:
             response = await client.get(url)
             if response.status_code == 200:
@@ -106,12 +106,13 @@ async def upsert_crop_price(db, marketplace_id: int, price_data_list: list) -> D
         variations = []
 
         for item in price_data_list:
-            rmin = item.get("rmin", 0) or 0
-            rmax = item.get("rmax", 0) or 0
-            pmin = item.get("pmin", 0) or 0
-            pmax = item.get("pmax", 0) or 0
-            wmin = item.get("wmin", 0) or 0
-            wmax = item.get("wmax", 0) or 0
+            # Convert to float to handle both string and numeric values
+            rmin = float(item.get("rmin", 0) or 0)
+            rmax = float(item.get("rmax", 0) or 0)
+            pmin = float(item.get("pmin", 0) or 0)
+            pmax = float(item.get("pmax", 0) or 0)
+            wmin = float(item.get("wmin", 0) or 0)
+            wmax = float(item.get("wmax", 0) or 0)
 
             if rmin > 0:
                 all_retail_mins.append(rmin)
@@ -209,12 +210,12 @@ async def upsert_crop_price(db, marketplace_id: int, price_data_list: list) -> D
             db.add(price)
             action = "inserted"
 
-        await db.commit()
+        await db.flush()  # Use flush instead of commit - commit will be called by caller
         return {"action": action, "crop_name": crop_name, "variety_name": variety_name, "variation_count": len(variations)}
 
     except Exception as e:
-        await db.rollback()
-        raise
+        logger.error(f"Error processing crop price: {str(e)}")
+        return {"action": "error", "crop_name": None, "variety_name": None, "error": str(e)}
 
 
 async def sync_prices():
@@ -242,12 +243,16 @@ async def sync_prices():
 
             for i, marketplace in enumerate(marketplaces, 1):
                 try:
+                    # Extract marketplace info early to avoid lazy loading issues
+                    marketplace_id = marketplace.marketplace_id
+                    marketplace_name = marketplace.name
+                    
                     # Fetch prices for this marketplace
-                    crop_data_list = await fetch_marketplace_crops(marketplace.marketplace_id)
+                    crop_data_list = await fetch_marketplace_crops(marketplace_id)
 
                     if crop_data_list:
                         stats["marketplaces_with_prices"] += 1
-                        print(f"\n[{i}/{len(marketplaces)}] {marketplace.name}")
+                        print(f"\n[{i}/{len(marketplaces)}] {marketplace_name}")
                         print(f"  Found {len(crop_data_list)} crop price entries")
 
                         # Group prices by (crop_name, variety_name) to aggregate variations
@@ -262,7 +267,7 @@ async def sync_prices():
 
                         for (crop_name, variety_name), price_list in grouped_prices.items():
                             try:
-                                result = await upsert_crop_price(db, marketplace.marketplace_id, price_list)
+                                result = await upsert_crop_price(db, marketplace_id, price_list)
 
                                 if result["action"] == "inserted":
                                     stats["prices_inserted"] += 1
@@ -278,13 +283,16 @@ async def sync_prices():
                                 stats["errors"] += 1
                                 logger.error(f"Error processing price {crop_name}: {e}")
 
+                        # Commit all changes after processing all items for this marketplace
+                        await db.commit()
+
                     else:
                         stats["marketplaces_without_prices"] += 1
 
                     stats["marketplaces_processed"] += 1
 
                 except Exception as e:
-                    logger.error(f"Error for marketplace {marketplace.name}: {e}")
+                    logger.error(f"Error for marketplace {marketplace_name if 'marketplace_name' in locals() else 'unknown'}: {e}")
 
             print("\n" + "=" * 80)
             logger.info("✓ Crop prices sync complete!")

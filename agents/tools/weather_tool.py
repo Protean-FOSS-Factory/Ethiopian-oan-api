@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Tool
 from agents.tools.maps import forward_geocode
 from helpers.utils import get_logger
-
+from app.core.cache import cache
 logger = get_logger(__name__)
 
 CURRENT_WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
@@ -16,14 +16,21 @@ FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
 
 API_KEY = os.getenv("OPENWEATHERMAP_API_KEY", "")
 TIMEOUT = 10.0
+WEATHER_CACHE_TTL = 15 * 60  # 15 minutes
 
 # -----------------------
 # Current Weather Tool
 # -----------------------
+# -----------------------
+# Current Weather Tool
+# -----------------------
 class CurrentWeatherInput(BaseModel):
-    location: str = Field(..., description="Location name (e.g., city, town)")
+    latitude: float | None = None
+    longitude: float | None = None
+    location: str | None = Field(None, description="Location name (optional if lat/lon provided)")
     units: Literal["metric", "imperial"] = "metric"
-    
+    language: str = "en"  # Added language support to match caller
+
 class CurrentWeather(BaseModel):
     timestamp: int
     temperature: float
@@ -44,23 +51,48 @@ async def get_current_weather(input: CurrentWeatherInput) -> CurrentWeather:
     Get the CURRENT weather conditions for a specific latitude and longitude.
     Use this tool ONLY when the user asks about the weather right now or current conditions."""    
     try:
-        location = await forward_geocode(input.location)
+        lat = input.latitude
+        lon = input.longitude
+
+        # Validated: if lat/lon missing, geocode 'location'
+        if lat is None or lon is None:
+            if not input.location:
+                raise ValueError("Must provide either latitude/longitude OR location name")
+            
+            from agents.tools.maps import forward_geocode
+            geo_location = await forward_geocode(input.location)
+            if not geo_location:
+                raise ValueError(f"Could not find location: {input.location}")
+            lat = geo_location.latitude
+            lon = geo_location.longitude
+
+        # Create cache key based on location and units
+        cache_key = f"weather:current:{lat}:{lon}:{input.units}"
+        
+        # Try to get from cache first
+        cached_data = await cache.get(cache_key)
+        if cached_data:
+            logger.info(f"Cache HIT for current weather: {cache_key}")
+            return CurrentWeather(**cached_data)
+        
+        logger.info(f"Cache MISS for current weather: {cache_key}")
+        
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             response = await client.get(
                 CURRENT_WEATHER_URL,
                 params={
-                    "lat": location.latitude,
-                    "lon": location.longitude,
+                    "lat": lat,
+                    "lon": lon,
                     "appid": API_KEY,
                     "units": input.units,
-                    "lang": "en",
+                    "lang": input.language,
                 },
             )
             response.raise_for_status()
             data = response.json()
-            logger.info(f"Fetched current weather for ({location.latitude}, {location.longitude}, units={input.units}, language=en)")
-            logger.info(f"Current weather data: {data}")
-            return CurrentWeather(
+            logger.info(f"Fetched current weather for ({lat}, {lon})")
+            
+            weather = CurrentWeather(
                 timestamp=data["dt"],
                 temperature=data["main"]["temp"],
                 feels_like=data["main"]["feels_like"],
@@ -73,24 +105,26 @@ async def get_current_weather(input: CurrentWeatherInput) -> CurrentWeather:
                 description=data["weather"][0]["description"],
                 source="OpenWeatherMap",
             )
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Weather API error: {e.response.status_code} - {e.response.text}")
-        raise Exception(f"Unable to fetch weather data: {e.response.status_code}")
-    except httpx.RequestError as e:
-        logger.error(f"Weather API request error: {e}")
-        raise Exception("Unable to connect to weather service")
-    except Exception as e:
-        logger.error(f"Unexpected error fetching weather: {e}")
-        raise
+            
+            # Cache the result
+            await cache.set(cache_key, weather.model_dump(), ttl=WEATHER_CACHE_TTL)
+            return weather
 
+    except Exception as e:
+        logger.error(f"Error serving weather: {e}")
+        raise
 
 
 # ------------------------
 # Weather Forecast Tool
 # ------------------------
 class ForecastInput(BaseModel):
-    location: str = Field(..., description="Location name (e.g., city, town)")
+    latitude: float | None = None
+    longitude: float | None = None
+    location: str | None = Field(None, description="Location name (optional if lat/lon provided)")
     units: Literal["metric", "imperial"] = "metric"
+    language: str = "en"
+
 class HourlyForecast(BaseModel):
     timestamp: int
     temperature: float
@@ -122,20 +156,39 @@ class WeatherForecast(BaseModel):
 
 
 async def get_weather_forecast(input: ForecastInput) -> str:
-    """Get the WEATHER FORECAST for a location.
-    Use this tool when the user asks about future weather, tomorrow, or the coming days.
-    Returns a human-readable summary optimized for quick understanding."""
+    """Get the WEATHER FORECAST for a location."""
     try:
-        location = await forward_geocode(input.location)
+        lat = input.latitude
+        lon = input.longitude
+
+        if lat is None or lon is None:
+            if not input.location:
+                raise ValueError("Must provide either latitude/longitude OR location name")
+            
+            from agents.tools.maps import forward_geocode
+            geo_location = await forward_geocode(input.location)
+            if not geo_location:
+                raise ValueError(f"Could not find location: {input.location}")
+            lat = geo_location.latitude
+            lon = geo_location.longitude
+        
+        # Create cache key based on location and units
+        cache_key = f"weather:forecast:{lat}:{lon}:{input.units}"
+        
+        # Try to get from cache first
+        cached_data = await cache.get(cache_key)
+        if cached_data:
+            return cached_data
+        
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             response = await client.get(
                 FORECAST_URL,
                 params={
-                    "lat": location.latitude,
-                    "lon": location.longitude,
+                    "lat": lat,
+                    "lon": lon,
                     "appid": API_KEY,
                     "units": input.units,
-                    "lang": "en",
+                    "lang": input.language,
                 },  
             )
             response.raise_for_status()
@@ -170,7 +223,7 @@ async def get_weather_forecast(input: ForecastInput) -> str:
         rain_prob = max(i.get("pop", 0) for i in items) * 100
         description = items[len(items)//2]["weather"][0]["description"]  # mid-day description
         
-        date_str = date.strftime("%a %d %b")
+        date_str = date.strftime("%a %d %b %Y")
         min_t, max_t = round(min(temps)), round(max(temps))
         avg_humidity = round(sum(humidities) / len(humidities))
         avg_wind = round(sum(winds) / len(winds), 1)
@@ -181,4 +234,9 @@ async def get_weather_forecast(input: ForecastInput) -> str:
     summary = "\n".join(lines)
     logger.info(summary)
     logger.info(f"Generated weather forecast summary for {len(daily_map)} days")
+    
+    # Cache the result
+    await cache.set(cache_key, summary, ttl=WEATHER_CACHE_TTL)
+    logger.info(f"Cached weather forecast for {WEATHER_CACHE_TTL}s: {cache_key}")
+    
     return summary
