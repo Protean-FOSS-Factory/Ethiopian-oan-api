@@ -102,6 +102,10 @@ def convert_numbers_to_words(text: str, lang: str) -> str:
 class TTSProvider:
     """Abstract base class for TTS providers"""
 
+    async def preload(self, langs: list[str]) -> None:
+        """Pre-load models/tokenizers for the given language codes."""
+        pass
+
     async def stream_audio(
         self,
         text_stream: AsyncGenerator[str, None],
@@ -224,6 +228,10 @@ class MMSTTSProvider(TTSProvider):
         update_current_observation(metadata={"pcm_bytes": len(pcm)})
         return pcm
 
+    async def preload(self, langs: list[str]) -> None:
+        for lang in langs:
+            await self._load_model(lang)
+
     async def _synthesize_chunk(self, text: str, lang: str) -> bytes:
         """Async wrapper for pipeline.py compatibility (lines 1017, 1191)."""
         return await self._synthesize(text, lang)
@@ -281,16 +289,228 @@ class MMSTTSProvider(TTSProvider):
         logger.info("MMSTTSProvider: models cleaned up")
 
 
+class TritonMMSTTSProvider(TTSProvider):
+    """TTS provider that routes Amharic to a Triton Inference Server (ONNX on GPU)
+    and falls back to local HuggingFace inference for English.
+
+    Env vars:
+        TRITON_TTS_URL   — Triton base URL, e.g. http://13.232.101.17:8000
+        TRITON_TTS_MODEL — model name on Triton (default: mms-tts-amh)
+        TTS_MODEL_EN     — HuggingFace model id for English (default: facebook/mms-tts-eng)
+    """
+
+    AMHARIC_TOKENIZER_ID = "facebook/mms-tts-amh"
+
+    def __init__(self):
+        self.triton_url = os.getenv("TRITON_TTS_URL", "").rstrip("/").replace("http://", "")
+        self.triton_model = os.getenv("TRITON_TTS_MODEL", "mms-tts-amh")
+        self.en_model_id = os.getenv("TTS_MODEL_EN", "facebook/mms-tts-eng")
+        self.native_sample_rate = 16000
+        self.target_sample_rate = 24000
+        self.device = os.getenv("TTS_DEVICE", "cpu")
+
+        self._am_tokenizer = None
+        self._en_model = None
+        self._en_tokenizer = None
+        self._resampler = None
+        self._lock = asyncio.Lock()
+
+        logger.info(
+            f"TritonMMSTTSProvider initialized: triton={self.triton_url}/{self.triton_model}, "
+            f"en_model={self.en_model_id}"
+        )
+
+    async def _load_am_tokenizer(self):
+        if self._am_tokenizer is not None:
+            return
+        async with self._lock:
+            if self._am_tokenizer is not None:
+                return
+            from transformers import VitsTokenizer
+            loop = asyncio.get_event_loop()
+            self._am_tokenizer = await loop.run_in_executor(
+                None, VitsTokenizer.from_pretrained, self.AMHARIC_TOKENIZER_ID
+            )
+            logger.info("Amharic tokenizer loaded from HuggingFace")
+
+    async def _load_en_model(self):
+        if self._en_model is not None:
+            return
+        async with self._lock:
+            if self._en_model is not None:
+                return
+            from transformers import VitsModel, AutoTokenizer
+            import torch
+
+            def _load():
+                tok = AutoTokenizer.from_pretrained(self.en_model_id)
+                mdl = VitsModel.from_pretrained(self.en_model_id).to(self.device)
+                mdl.eval()
+                return mdl, tok
+
+            loop = asyncio.get_event_loop()
+            self._en_model, self._en_tokenizer = await loop.run_in_executor(None, _load)
+            logger.info(f"English TTS model loaded: {self.en_model_id}")
+
+    def _get_resampler(self):
+        if self._resampler is None:
+            import torchaudio
+            self._resampler = torchaudio.transforms.Resample(
+                orig_freq=self.native_sample_rate,
+                new_freq=self.target_sample_rate,
+            )
+        return self._resampler
+
+    def _waveform_to_pcm(self, waveform_f32) -> bytes:
+        """float32 waveform (numpy, 16kHz) → int16 PCM bytes at 24kHz."""
+        import torch
+        import numpy as np
+
+        t = torch.from_numpy(waveform_f32).float()
+        resampler = self._get_resampler()
+        t = resampler(t.unsqueeze(0)).squeeze(0)
+        audio_np = t.numpy()
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+        return (audio_np * 32767).astype(np.int16).tobytes()
+
+    def _triton_infer_sync(self, text: str) -> bytes:
+        """Synchronous Triton inference for Amharic text → int16 PCM bytes at 24kHz."""
+        import numpy as np
+        import tritonclient.http as httpclient
+
+        inputs = self._am_tokenizer(text, return_tensors="np")
+        input_ids = inputs["input_ids"].astype(np.int64)
+        attention_mask = inputs["attention_mask"].astype(np.int64)
+
+        client = httpclient.InferenceServerClient(url=self.triton_url)
+
+        infer_inputs = [
+            httpclient.InferInput("input_ids", input_ids.shape, "INT64"),
+            httpclient.InferInput("attention_mask", attention_mask.shape, "INT64"),
+        ]
+        infer_inputs[0].set_data_from_numpy(input_ids)
+        infer_inputs[1].set_data_from_numpy(attention_mask)
+
+        infer_outputs = [httpclient.InferRequestedOutput("waveform")]
+        response = client.infer(self.triton_model, infer_inputs, outputs=infer_outputs)
+        waveform = response.as_numpy("waveform").squeeze()  # float32 [samples] at 16kHz
+        return self._waveform_to_pcm(waveform)
+
+    def _en_infer_sync(self, text: str) -> bytes:
+        """Synchronous local inference for English text → int16 PCM bytes at 24kHz."""
+        import torch
+        import numpy as np
+
+        inputs = self._en_tokenizer(text, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            output = self._en_model(**inputs)
+        waveform = output.waveform[0].cpu().numpy()
+        return self._waveform_to_pcm(waveform)
+
+    async def preload(self, langs: list[str]) -> None:
+        for lang in langs:
+            if lang == "am":
+                await self._load_am_tokenizer()
+            else:
+                await self._load_en_model()
+
+    @observe(name="tts.triton", as_type="generation")
+    async def _synthesize(self, text: str, lang: str) -> bytes:
+        text = convert_numbers_to_words(text.strip(), lang)
+        if not text:
+            return b""
+
+        update_current_observation(
+            input=text,
+            metadata={"provider": "triton_mms_tts", "lang": lang, "model": self.triton_model if lang == "am" else self.en_model_id},
+        )
+
+        loop = asyncio.get_event_loop()
+        if lang == "am":
+            await self._load_am_tokenizer()
+            pcm = await loop.run_in_executor(None, self._triton_infer_sync, text)
+        else:
+            await self._load_en_model()
+            pcm = await loop.run_in_executor(None, self._en_infer_sync, text)
+
+        update_current_observation(metadata={"pcm_bytes": len(pcm)})
+        return pcm
+
+    async def _synthesize_chunk(self, text: str, lang: str) -> bytes:
+        return await self._synthesize(text, lang)
+
+    async def stream_audio(
+        self,
+        text_stream: AsyncGenerator[str, None],
+        lang: str = "en"
+    ) -> AsyncGenerator[bytes, None]:
+        lang_code = "en" if lang.startswith("en") else "am"
+        if lang_code == "am":
+            await self._load_am_tokenizer()
+        else:
+            await self._load_en_model()
+
+        buffer = ""
+        delimiters = {".", "!", "?", ";", "\n", ","}
+        chunk_size = 4096
+
+        async def yield_pcm(text: str):
+            pcm = await self._synthesize(text, lang_code)
+            if not pcm:
+                return
+            offset = 0
+            while offset < len(pcm):
+                yield pcm[offset:offset + chunk_size]
+                offset += chunk_size
+
+        async for text_chunk in text_stream:
+            if not text_chunk:
+                continue
+            buffer += text_chunk
+            if any(c in delimiters for c in text_chunk):
+                split_idx = max((i for i, c in enumerate(buffer) if c in delimiters), default=-1)
+                if split_idx != -1:
+                    to_synth = buffer[:split_idx + 1].strip()
+                    buffer = buffer[split_idx + 1:].strip()
+                    if to_synth:
+                        async for audio_bytes in yield_pcm(to_synth):
+                            yield audio_bytes
+            elif len(buffer) > 80:
+                async for audio_bytes in yield_pcm(buffer):
+                    yield audio_bytes
+                buffer = ""
+
+        if buffer.strip():
+            async for audio_bytes in yield_pcm(buffer.strip()):
+                yield audio_bytes
+
+    def cleanup(self):
+        self._am_tokenizer = None
+        self._en_model = None
+        self._en_tokenizer = None
+        self._resampler = None
+        logger.info("TritonMMSTTSProvider: cleaned up")
+
+
 # Singleton
 _tts_provider: Optional[TTSProvider] = None
 
 
 def get_tts_provider() -> TTSProvider:
-    """Get the MMS-TTS provider (singleton)."""
+    """Get the TTS provider singleton.
+
+    Uses TritonMMSTTSProvider when TRITON_TTS_URL is set,
+    otherwise falls back to local MMSTTSProvider.
+    """
     global _tts_provider
     if _tts_provider is None:
-        _tts_provider = MMSTTSProvider()
-        logger.info("TTS Provider initialized: mms_tts")
+        triton_url = os.getenv("TRITON_TTS_URL", "")
+        if triton_url:
+            _tts_provider = TritonMMSTTSProvider()
+            logger.info("TTS Provider initialized: triton_mms_tts")
+        else:
+            _tts_provider = MMSTTSProvider()
+            logger.info("TTS Provider initialized: mms_tts")
 
     return _tts_provider
 
