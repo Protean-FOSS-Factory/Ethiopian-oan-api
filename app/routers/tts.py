@@ -2,6 +2,7 @@ from app.services.providers.tts import get_tts_provider
 from helpers.utils import get_logger
 import uuid
 import base64
+import struct
 from fastapi import APIRouter, HTTPException
 from app.models.requests import TTSRequest
 from app.models.responses import TTSResponse
@@ -10,6 +11,26 @@ from helpers.langfuse_client import observe, update_current_trace, update_curren
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/tts", tags=["tts"])
+
+PCM_SAMPLE_RATE = 24000
+PCM_CHANNELS = 1
+PCM_BITS_PER_SAMPLE = 16
+
+
+def _pcm_to_wav(pcm: bytes,
+                sample_rate: int = PCM_SAMPLE_RATE,
+                channels: int = PCM_CHANNELS,
+                bits_per_sample: int = PCM_BITS_PER_SAMPLE) -> bytes:
+    """Wrap int16 PCM bytes in a RIFF/WAVE header so browsers can play it."""
+    byte_rate = sample_rate * channels * bits_per_sample // 8
+    block_align = channels * bits_per_sample // 8
+    data_size = len(pcm)
+    return (
+        b"RIFF" + struct.pack("<I", 36 + data_size) + b"WAVE"
+        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, sample_rate,
+                                byte_rate, block_align, bits_per_sample)
+        + b"data" + struct.pack("<I", data_size) + pcm
+    )
 
 @router.post("/", response_model=TTSResponse)
 @observe(name="tts.synthesize", as_type="generation")
@@ -33,9 +54,14 @@ async def tts(request: TTSRequest):
             metadata={"provider": type(provider).__name__, "lang_code": lang_code},
         )
         audio_bytes = await provider._synthesize(request.text, lang_code)
+        wav_bytes = _pcm_to_wav(audio_bytes)
+        logger.info(
+            f"TTS synth: lang={lang_code}, pcm_bytes={len(audio_bytes)}, "
+            f"wav_bytes={len(wav_bytes)}"
+        )
 
         # Base64 encode the binary audio data for JSON serialization
-        audio_data = base64.b64encode(audio_bytes).decode('utf-8')
+        audio_data = base64.b64encode(wav_bytes).decode('utf-8')
 
         return TTSResponse(
             status='success',

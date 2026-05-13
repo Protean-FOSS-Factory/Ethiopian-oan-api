@@ -290,67 +290,57 @@ class MMSTTSProvider(TTSProvider):
 
 
 class TritonMMSTTSProvider(TTSProvider):
-    """TTS provider that routes Amharic to a Triton Inference Server (ONNX on GPU)
-    and falls back to local HuggingFace inference for English.
+    """TTS provider that routes both English and Amharic to a Triton Inference Server.
+
+    Both Triton models are MMS-TTS family (16kHz output, identical IO contract:
+    input_ids + attention_mask → waveform). HuggingFace tokenizers are still
+    used locally to produce input_ids; only the heavy VITS inference runs on Triton.
 
     Env vars:
-        TRITON_TTS_URL   — Triton base URL, e.g. http://13.232.101.17:8000
-        TRITON_TTS_MODEL — model name on Triton (default: mms-tts-amh)
-        TTS_MODEL_EN     — HuggingFace model id for English (default: facebook/mms-tts-eng)
+        TRITON_TTS_URL      — Triton base URL, e.g. http://13.232.101.17:8000
+        TRITON_TTS_MODEL_AM — Triton model name for Amharic (default: mms-tts-amh)
+        TRITON_TTS_MODEL_EN — Triton model name for English (default: mms-tts-eng)
     """
 
-    AMHARIC_TOKENIZER_ID = "facebook/mms-tts-amh"
+    AM_TOKENIZER_ID = "facebook/mms-tts-amh"
+    EN_TOKENIZER_ID = "facebook/mms-tts-eng"
 
     def __init__(self):
         self.triton_url = os.getenv("TRITON_TTS_URL", "").rstrip("/").replace("http://", "")
-        self.triton_model = os.getenv("TRITON_TTS_MODEL", "mms-tts-amh")
-        self.en_model_id = os.getenv("TTS_MODEL_EN", "facebook/mms-tts-eng")
+        # Back-compat: TRITON_TTS_MODEL was previously the Amharic-only var.
+        self.triton_model_am = os.getenv(
+            "TRITON_TTS_MODEL_AM", os.getenv("TRITON_TTS_MODEL", "mms-tts-amh")
+        )
+        self.triton_model_en = os.getenv("TRITON_TTS_MODEL_EN", "mms-tts-eng")
         self.native_sample_rate = 16000
         self.target_sample_rate = 24000
-        self.device = os.getenv("TTS_DEVICE", "cpu")
 
         self._am_tokenizer = None
-        self._en_model = None
         self._en_tokenizer = None
         self._resampler = None
         self._lock = asyncio.Lock()
 
         logger.info(
-            f"TritonMMSTTSProvider initialized: triton={self.triton_url}/{self.triton_model}, "
-            f"en_model={self.en_model_id}"
+            f"TritonMMSTTSProvider initialized: triton={self.triton_url}, "
+            f"am_model={self.triton_model_am}, en_model={self.triton_model_en}"
         )
 
-    async def _load_am_tokenizer(self):
-        if self._am_tokenizer is not None:
+    async def _load_tokenizer(self, lang: str):
+        """Load the MMS tokenizer for `lang` ('am' or 'en'). Idempotent."""
+        attr = "_am_tokenizer" if lang == "am" else "_en_tokenizer"
+        tok_id = self.AM_TOKENIZER_ID if lang == "am" else self.EN_TOKENIZER_ID
+        if getattr(self, attr) is not None:
             return
         async with self._lock:
-            if self._am_tokenizer is not None:
+            if getattr(self, attr) is not None:
                 return
             from transformers import VitsTokenizer
             loop = asyncio.get_event_loop()
-            self._am_tokenizer = await loop.run_in_executor(
-                None, VitsTokenizer.from_pretrained, self.AMHARIC_TOKENIZER_ID
+            tokenizer = await loop.run_in_executor(
+                None, VitsTokenizer.from_pretrained, tok_id
             )
-            logger.info("Amharic tokenizer loaded from HuggingFace")
-
-    async def _load_en_model(self):
-        if self._en_model is not None:
-            return
-        async with self._lock:
-            if self._en_model is not None:
-                return
-            from transformers import VitsModel, AutoTokenizer
-            import torch
-
-            def _load():
-                tok = AutoTokenizer.from_pretrained(self.en_model_id)
-                mdl = VitsModel.from_pretrained(self.en_model_id).to(self.device)
-                mdl.eval()
-                return mdl, tok
-
-            loop = asyncio.get_event_loop()
-            self._en_model, self._en_tokenizer = await loop.run_in_executor(None, _load)
-            logger.info(f"English TTS model loaded: {self.en_model_id}")
+            setattr(self, attr, tokenizer)
+            logger.info(f"{lang.upper()} MMS tokenizer loaded from HuggingFace")
 
     def _get_resampler(self):
         if self._resampler is None:
@@ -373,12 +363,19 @@ class TritonMMSTTSProvider(TTSProvider):
         audio_np = np.clip(audio_np, -1.0, 1.0)
         return (audio_np * 32767).astype(np.int16).tobytes()
 
-    def _triton_infer_sync(self, text: str) -> bytes:
-        """Synchronous Triton inference for Amharic text → int16 PCM bytes at 24kHz."""
+    def _triton_infer_sync(self, text: str, lang: str) -> bytes:
+        """Tokenize locally, run inference on Triton, return int16 PCM at 24kHz."""
         import numpy as np
         import tritonclient.http as httpclient
 
-        inputs = self._am_tokenizer(text, return_tensors="np")
+        if lang == "am":
+            tokenizer = self._am_tokenizer
+            model_name = self.triton_model_am
+        else:
+            tokenizer = self._en_tokenizer
+            model_name = self.triton_model_en
+
+        inputs = tokenizer(text, return_tensors="np")
         input_ids = inputs["input_ids"].astype(np.int64)
         attention_mask = inputs["attention_mask"].astype(np.int64)
 
@@ -392,27 +389,13 @@ class TritonMMSTTSProvider(TTSProvider):
         infer_inputs[1].set_data_from_numpy(attention_mask)
 
         infer_outputs = [httpclient.InferRequestedOutput("waveform")]
-        response = client.infer(self.triton_model, infer_inputs, outputs=infer_outputs)
+        response = client.infer(model_name, infer_inputs, outputs=infer_outputs)
         waveform = response.as_numpy("waveform").squeeze()  # float32 [samples] at 16kHz
-        return self._waveform_to_pcm(waveform)
-
-    def _en_infer_sync(self, text: str) -> bytes:
-        """Synchronous local inference for English text → int16 PCM bytes at 24kHz."""
-        import torch
-        import numpy as np
-
-        inputs = self._en_tokenizer(text, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            output = self._en_model(**inputs)
-        waveform = output.waveform[0].cpu().numpy()
         return self._waveform_to_pcm(waveform)
 
     async def preload(self, langs: list[str]) -> None:
         for lang in langs:
-            if lang == "am":
-                await self._load_am_tokenizer()
-            else:
-                await self._load_en_model()
+            await self._load_tokenizer("am" if lang == "am" else "en")
 
     @observe(name="tts.triton", as_type="generation")
     async def _synthesize(self, text: str, lang: str) -> bytes:
@@ -420,18 +403,17 @@ class TritonMMSTTSProvider(TTSProvider):
         if not text:
             return b""
 
+        lang_code = "am" if lang == "am" else "en"
+        model_name = self.triton_model_am if lang_code == "am" else self.triton_model_en
+
         update_current_observation(
             input=text,
-            metadata={"provider": "triton_mms_tts", "lang": lang, "model": self.triton_model if lang == "am" else self.en_model_id},
+            metadata={"provider": "triton_mms_tts", "lang": lang_code, "model": model_name},
         )
 
+        await self._load_tokenizer(lang_code)
         loop = asyncio.get_event_loop()
-        if lang == "am":
-            await self._load_am_tokenizer()
-            pcm = await loop.run_in_executor(None, self._triton_infer_sync, text)
-        else:
-            await self._load_en_model()
-            pcm = await loop.run_in_executor(None, self._en_infer_sync, text)
+        pcm = await loop.run_in_executor(None, self._triton_infer_sync, text, lang_code)
 
         update_current_observation(metadata={"pcm_bytes": len(pcm)})
         return pcm
@@ -445,10 +427,7 @@ class TritonMMSTTSProvider(TTSProvider):
         lang: str = "en"
     ) -> AsyncGenerator[bytes, None]:
         lang_code = "en" if lang.startswith("en") else "am"
-        if lang_code == "am":
-            await self._load_am_tokenizer()
-        else:
-            await self._load_en_model()
+        await self._load_tokenizer(lang_code)
 
         buffer = ""
         delimiters = {".", "!", "?", ";", "\n", ","}
@@ -486,7 +465,6 @@ class TritonMMSTTSProvider(TTSProvider):
 
     def cleanup(self):
         self._am_tokenizer = None
-        self._en_model = None
         self._en_tokenizer = None
         self._resampler = None
         logger.info("TritonMMSTTSProvider: cleaned up")
