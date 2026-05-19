@@ -46,18 +46,36 @@ async def tts(request: TTSRequest):
         tags=["tts", f"lang:{request.lang_code}"],
     )
 
+    requested_model = (request.model or "").strip() or None
+
+    raw_lang = (request.lang_code or "").lower()
+    if requested_model == "mms-tts-orm" or raw_lang.startswith("om") or raw_lang.startswith("orm"):
+        raise HTTPException(
+            status_code=501,
+            detail="Oromo TTS is temporarily disabled. Use an English or Amharic voice for now.",
+        )
+
     try:
         provider = get_tts_provider()
-        lang_code = "en" if request.lang_code.startswith("en") else "am"
+        lang_code = "am" if raw_lang.startswith("am") else "en"
         update_current_observation(
             input=request.text,
-            metadata={"provider": type(provider).__name__, "lang_code": lang_code},
+            metadata={
+                "provider": type(provider).__name__,
+                "lang_code": lang_code,
+                "voice_id": request.voice_id,
+                "model": requested_model,
+                "speaker_id": request.speaker_id,
+            },
         )
-        audio_bytes = await provider._synthesize(request.text, lang_code)
+        audio_bytes = await provider._synthesize(
+            request.text, lang_code, requested_model, request.speaker_id
+        )
         wav_bytes = _pcm_to_wav(audio_bytes)
         logger.info(
-            f"TTS synth: lang={lang_code}, pcm_bytes={len(audio_bytes)}, "
-            f"wav_bytes={len(wav_bytes)}"
+            f"TTS synth: voice_id={request.voice_id}, lang={lang_code}, "
+            f"model={requested_model or 'default'}, speaker_id={request.speaker_id}, "
+            f"pcm_bytes={len(audio_bytes)}, wav_bytes={len(wav_bytes)}"
         )
 
         # Base64 encode the binary audio data for JSON serialization
@@ -68,6 +86,11 @@ async def tts(request: TTSRequest):
             audio_content=audio_data,
             session_id=request.session_id or str(uuid.uuid4())
         )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.error(f"TTS bad request: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"TTS error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"TTS failed: {str(e)}")

@@ -5,6 +5,7 @@ Env-configurable: swap models by changing TTS_MODEL_AM / TTS_MODEL_EN.
 """
 
 import os
+import json
 import asyncio
 import struct
 from typing import AsyncGenerator, Optional
@@ -290,11 +291,13 @@ class MMSTTSProvider(TTSProvider):
 
 
 class TritonMMSTTSProvider(TTSProvider):
-    """TTS provider that routes both English and Amharic to a Triton Inference Server.
+    """TTS provider that routes MMS and Piper voices to a Triton Inference Server.
 
-    Both Triton models are MMS-TTS family (16kHz output, identical IO contract:
-    input_ids + attention_mask → waveform). HuggingFace tokenizers are still
-    used locally to produce input_ids; only the heavy VITS inference runs on Triton.
+    - MMS family (mms-tts-eng / -amh / -orm): 16kHz output, IO = input_ids +
+      attention_mask → waveform. HuggingFace VitsTokenizer is used locally.
+    - Piper voices (piper-am, …): 22050 Hz output, IO = input (phoneme IDs) +
+      input_lengths + scales + sid → output. Phonemization runs locally via the
+      espeak-ng binary and a phoneme_id_map loaded from the voice's .onnx.json.
 
     Env vars:
         TRITON_TTS_URL      — Triton base URL, e.g. http://13.232.101.17:8000
@@ -302,45 +305,65 @@ class TritonMMSTTSProvider(TTSProvider):
         TRITON_TTS_MODEL_EN — Triton model name for English (default: mms-tts-eng)
     """
 
-    AM_TOKENIZER_ID = "facebook/mms-tts-amh"
-    EN_TOKENIZER_ID = "facebook/mms-tts-eng"
+    # lang_code → (default Triton model name, HF tokenizer id) for MMS-TTS family
+    MMS_LANGS = {
+        "en": ("mms-tts-eng", "facebook/mms-tts-eng"),
+        "am": ("mms-tts-amh", "facebook/mms-tts-amh"),
+        "om": ("mms-tts-orm", "facebook/mms-tts-orm"),
+    }
+    # Triton model name → HF tokenizer id (for explicit model overrides)
+    MODEL_TO_TOKENIZER = {
+        "mms-tts-eng": "facebook/mms-tts-eng",
+        "mms-tts-amh": "facebook/mms-tts-amh",
+        "mms-tts-orm": "facebook/mms-tts-orm",
+    }
+    # Piper voices: Triton model name → path to .onnx.json with phoneme/speaker maps
+    PIPER_CONFIG_PATHS = {
+        "piper-am": "assets/piper/am/am_ET-l_geez-medium.onnx.json",
+    }
+    PIPER_NATIVE_SAMPLE_RATE = 22050
 
     def __init__(self):
         self.triton_url = os.getenv("TRITON_TTS_URL", "").rstrip("/").replace("http://", "")
-        # Back-compat: TRITON_TTS_MODEL was previously the Amharic-only var.
-        self.triton_model_am = os.getenv(
-            "TRITON_TTS_MODEL_AM", os.getenv("TRITON_TTS_MODEL", "mms-tts-amh")
-        )
-        self.triton_model_en = os.getenv("TRITON_TTS_MODEL_EN", "mms-tts-eng")
+        # Per-lang Triton model name, overridable via env (TRITON_TTS_MODEL kept for back-compat).
+        self.triton_models = {
+            "en": os.getenv("TRITON_TTS_MODEL_EN", "mms-tts-eng"),
+            "am": os.getenv(
+                "TRITON_TTS_MODEL_AM", os.getenv("TRITON_TTS_MODEL", "mms-tts-amh")
+            ),
+            "om": os.getenv("TRITON_TTS_MODEL_OM", "mms-tts-orm"),
+        }
         self.native_sample_rate = 16000
         self.target_sample_rate = 24000
 
-        self._am_tokenizer = None
-        self._en_tokenizer = None
+        self._tokenizers: dict[str, object] = {}  # HF tokenizer id → tokenizer
+        self._piper_configs: dict[str, dict] = {}  # model_name → loaded JSON
         self._resampler = None
+        self._piper_resampler = None
         self._lock = asyncio.Lock()
 
         logger.info(
             f"TritonMMSTTSProvider initialized: triton={self.triton_url}, "
-            f"am_model={self.triton_model_am}, en_model={self.triton_model_en}"
+            f"models={self.triton_models}"
         )
 
-    async def _load_tokenizer(self, lang: str):
-        """Load the MMS tokenizer for `lang` ('am' or 'en'). Idempotent."""
-        attr = "_am_tokenizer" if lang == "am" else "_en_tokenizer"
-        tok_id = self.AM_TOKENIZER_ID if lang == "am" else self.EN_TOKENIZER_ID
-        if getattr(self, attr) is not None:
+    async def _load_tokenizer(self, model_name: str):
+        """Load the MMS tokenizer for the given Triton model name. Idempotent."""
+        tok_id = self.MODEL_TO_TOKENIZER.get(model_name)
+        if tok_id is None:
+            raise ValueError(f"No tokenizer mapping for model '{model_name}'")
+        if tok_id in self._tokenizers:
             return
         async with self._lock:
-            if getattr(self, attr) is not None:
+            if tok_id in self._tokenizers:
                 return
             from transformers import VitsTokenizer
             loop = asyncio.get_event_loop()
             tokenizer = await loop.run_in_executor(
                 None, VitsTokenizer.from_pretrained, tok_id
             )
-            setattr(self, attr, tokenizer)
-            logger.info(f"{lang.upper()} MMS tokenizer loaded from HuggingFace")
+            self._tokenizers[tok_id] = tokenizer
+            logger.info(f"MMS tokenizer loaded: {tok_id}")
 
     def _get_resampler(self):
         if self._resampler is None:
@@ -363,17 +386,13 @@ class TritonMMSTTSProvider(TTSProvider):
         audio_np = np.clip(audio_np, -1.0, 1.0)
         return (audio_np * 32767).astype(np.int16).tobytes()
 
-    def _triton_infer_sync(self, text: str, lang: str) -> bytes:
+    def _triton_infer_sync(self, text: str, model_name: str) -> bytes:
         """Tokenize locally, run inference on Triton, return int16 PCM at 24kHz."""
         import numpy as np
         import tritonclient.http as httpclient
 
-        if lang == "am":
-            tokenizer = self._am_tokenizer
-            model_name = self.triton_model_am
-        else:
-            tokenizer = self._en_tokenizer
-            model_name = self.triton_model_en
+        tok_id = self.MODEL_TO_TOKENIZER[model_name]
+        tokenizer = self._tokenizers[tok_id]
 
         inputs = tokenizer(text, return_tensors="np")
         input_ids = inputs["input_ids"].astype(np.int64)
@@ -393,27 +412,170 @@ class TritonMMSTTSProvider(TTSProvider):
         waveform = response.as_numpy("waveform").squeeze()  # float32 [samples] at 16kHz
         return self._waveform_to_pcm(waveform)
 
+    def _get_piper_resampler(self):
+        if self._piper_resampler is None:
+            import torchaudio
+            self._piper_resampler = torchaudio.transforms.Resample(
+                orig_freq=self.PIPER_NATIVE_SAMPLE_RATE,
+                new_freq=self.target_sample_rate,
+            )
+        return self._piper_resampler
+
+    def _load_piper_config(self, model_name: str) -> dict:
+        """Load + cache the .onnx.json (phoneme_id_map, speaker_id_map, inference scales)."""
+        if model_name in self._piper_configs:
+            return self._piper_configs[model_name]
+        path = self.PIPER_CONFIG_PATHS.get(model_name)
+        if not path:
+            raise ValueError(f"No Piper voice config registered for model '{model_name}'")
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        self._piper_configs[model_name] = cfg
+        logger.info(
+            f"Piper voice config loaded: {model_name} from {path} "
+            f"(speakers={cfg.get('num_speakers')}, "
+            f"sr={cfg.get('audio', {}).get('sample_rate')})"
+        )
+        return cfg
+
+    @staticmethod
+    def _piper_phonemize(text: str, voice: str) -> str:
+        """Run espeak-ng to phonemize text into IPA. Returns a single string of
+        IPA characters (sentence boundaries flattened to a single space)."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["espeak-ng", "-q", "--ipa=3", "-v", voice, text],
+                capture_output=True, text=True, timeout=15,
+            )
+        except FileNotFoundError as e:
+            raise RuntimeError("espeak-ng binary not found; install with `brew install espeak-ng`") from e
+        if result.returncode != 0:
+            raise RuntimeError(f"espeak-ng failed: {result.stderr.strip()}")
+        return " ".join(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+    def _piper_text_to_ids(self, text: str, cfg: dict) -> list[int]:
+        """Phonemize and encode per Piper convention:
+        [BOS, p1, PAD, p2, PAD, …, pN, PAD, EOS]."""
+        voice = cfg.get("espeak", {}).get("voice", "am")
+        pim = cfg["phoneme_id_map"]
+        BOS = pim.get("^", [1])
+        EOS = pim.get("$", [2])
+        PAD = pim.get("_", [0])
+        phonemes = self._piper_phonemize(text, voice)
+        ids: list[int] = list(BOS)
+        skipped = 0
+        for ch in phonemes:
+            tok = pim.get(ch)
+            if tok is None:
+                skipped += 1
+                continue
+            ids.extend(tok)
+            ids.extend(PAD)
+        ids.extend(EOS)
+        if skipped:
+            logger.debug(f"Piper phonemize: skipped {skipped} unknown phoneme chars")
+        return ids
+
+    def _piper_waveform_to_pcm(self, waveform_f32) -> bytes:
+        """FP32 waveform at 22050 Hz → int16 PCM bytes at target_sample_rate (24kHz)."""
+        import torch, numpy as np
+        t = torch.from_numpy(waveform_f32).float()
+        resampler = self._get_piper_resampler()
+        t = resampler(t.unsqueeze(0)).squeeze(0)
+        audio_np = t.numpy()
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+        return (audio_np * 32767).astype(np.int16).tobytes()
+
+    def _piper_infer_sync(self, text: str, model_name: str, speaker_id: int) -> bytes:
+        """Phonemize locally, call Triton, return int16 PCM at target_sample_rate."""
+        import numpy as np
+        import tritonclient.http as httpclient
+
+        cfg = self._piper_configs[model_name]  # already loaded by caller
+        ids = self._piper_text_to_ids(text, cfg)
+        if len(ids) <= 2:  # only BOS+EOS — empty after skipping
+            return b""
+
+        input_ids = np.array([ids], dtype=np.int64)
+        input_lengths = np.array([len(ids)], dtype=np.int64)
+        inf = cfg.get("inference", {})
+        scales = np.array(
+            [inf.get("noise_scale", 0.667),
+             inf.get("length_scale", 1.0),
+             inf.get("noise_w", 0.8)],
+            dtype=np.float32,
+        )
+        sid = np.array([int(speaker_id)], dtype=np.int64)
+
+        client = httpclient.InferenceServerClient(url=self.triton_url)
+        infer_inputs = [
+            httpclient.InferInput("input", input_ids.shape, "INT64"),
+            httpclient.InferInput("input_lengths", input_lengths.shape, "INT64"),
+            httpclient.InferInput("scales", scales.shape, "FP32"),
+            httpclient.InferInput("sid", sid.shape, "INT64"),
+        ]
+        infer_inputs[0].set_data_from_numpy(input_ids)
+        infer_inputs[1].set_data_from_numpy(input_lengths)
+        infer_inputs[2].set_data_from_numpy(scales)
+        infer_inputs[3].set_data_from_numpy(sid)
+
+        infer_outputs = [httpclient.InferRequestedOutput("output")]
+        response = client.infer(model_name, infer_inputs, outputs=infer_outputs)
+
+        waveform = response.as_numpy("output").reshape(-1)  # FP32 [samples] @ 22050 Hz
+        return self._piper_waveform_to_pcm(waveform)
+
+    def _resolve_model(self, lang: str, model: Optional[str] = None) -> str:
+        """Pick the Triton model name. Explicit `model` wins; else map by lang."""
+        if model:
+            if model not in self.MODEL_TO_TOKENIZER:
+                raise ValueError(f"Unsupported TTS model '{model}' on TritonMMSTTSProvider")
+            return model
+        key = "am" if lang == "am" else ("om" if lang == "om" else "en")
+        return self.triton_models[key]
+
     async def preload(self, langs: list[str]) -> None:
         for lang in langs:
-            await self._load_tokenizer("am" if lang == "am" else "en")
+            key = "am" if lang == "am" else ("om" if lang == "om" else "en")
+            await self._load_tokenizer(self.triton_models[key])
 
     @observe(name="tts.triton", as_type="generation")
-    async def _synthesize(self, text: str, lang: str) -> bytes:
+    async def _synthesize(self, text: str, lang: str,
+                          model: Optional[str] = None,
+                          speaker_id: Optional[int] = None) -> bytes:
         text = convert_numbers_to_words(text.strip(), lang)
         if not text:
             return b""
 
-        lang_code = "am" if lang == "am" else "en"
-        model_name = self.triton_model_am if lang_code == "am" else self.triton_model_en
+        # Piper voices use a different IO contract (phoneme IDs + sid + scales)
+        # and ship a per-voice config JSON with the phoneme/speaker maps.
+        if model and model.startswith("piper"):
+            update_current_observation(
+                input=text,
+                metadata={"provider": "triton_piper", "lang": lang,
+                          "model": model, "speaker_id": speaker_id or 0},
+            )
+            self._load_piper_config(model)
+            sid = speaker_id if speaker_id is not None else 0
+            loop = asyncio.get_event_loop()
+            pcm = await loop.run_in_executor(
+                None, self._piper_infer_sync, text, model, sid
+            )
+            update_current_observation(metadata={"pcm_bytes": len(pcm)})
+            return pcm
+
+        # MMS-TTS path (mms-tts-eng / -amh / -orm)
+        model_name = self._resolve_model(lang, model)
 
         update_current_observation(
             input=text,
-            metadata={"provider": "triton_mms_tts", "lang": lang_code, "model": model_name},
+            metadata={"provider": "triton_mms_tts", "lang": lang, "model": model_name},
         )
 
-        await self._load_tokenizer(lang_code)
+        await self._load_tokenizer(model_name)
         loop = asyncio.get_event_loop()
-        pcm = await loop.run_in_executor(None, self._triton_infer_sync, text, lang_code)
+        pcm = await loop.run_in_executor(None, self._triton_infer_sync, text, model_name)
 
         update_current_observation(metadata={"pcm_bytes": len(pcm)})
         return pcm
@@ -426,8 +588,8 @@ class TritonMMSTTSProvider(TTSProvider):
         text_stream: AsyncGenerator[str, None],
         lang: str = "en"
     ) -> AsyncGenerator[bytes, None]:
-        lang_code = "en" if lang.startswith("en") else "am"
-        await self._load_tokenizer(lang_code)
+        lang_code = "am" if lang.startswith("am") else ("om" if lang.startswith("om") else "en")
+        await self._load_tokenizer(self.triton_models[lang_code])
 
         buffer = ""
         delimiters = {".", "!", "?", ";", "\n", ","}
@@ -464,9 +626,10 @@ class TritonMMSTTSProvider(TTSProvider):
                 yield audio_bytes
 
     def cleanup(self):
-        self._am_tokenizer = None
-        self._en_tokenizer = None
+        self._tokenizers.clear()
+        self._piper_configs.clear()
         self._resampler = None
+        self._piper_resampler = None
         logger.info("TritonMMSTTSProvider: cleaned up")
 
 

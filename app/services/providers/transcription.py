@@ -100,6 +100,56 @@ class AzureSTTProvider(TranscriptionProvider):
             return "audio/ogg; codecs=opus"
         return "audio/wav; codecs=audio/pcm; samplerate=16000"
 
+    @staticmethod
+    def _inspect_wav(audio_bytes: bytes) -> dict:
+        """Parse the WAV fmt chunk + compute peak/RMS of the int16 PCM data.
+
+        Returns {} for non-WAV input. Used purely for diagnostics so we can
+        tell silent-mic from sample-rate-mismatch from format errors.
+        """
+        import struct
+        if audio_bytes[:4] != b"RIFF" or audio_bytes[8:12] != b"WAVE":
+            return {}
+        # Walk RIFF chunks to find 'fmt ' and 'data'.
+        i = 12
+        fmt = {}
+        data_off = data_size = None
+        while i + 8 <= len(audio_bytes):
+            cid = audio_bytes[i:i+4]
+            csize = struct.unpack("<I", audio_bytes[i+4:i+8])[0]
+            body = audio_bytes[i+8:i+8+csize]
+            if cid == b"fmt " and len(body) >= 16:
+                audio_fmt, channels, rate, byte_rate, block_align, bps = struct.unpack("<HHIIHH", body[:16])
+                fmt = {"audio_fmt": audio_fmt, "channels": channels, "sample_rate": rate,
+                       "bits_per_sample": bps, "byte_rate": byte_rate, "block_align": block_align}
+            elif cid == b"data":
+                data_off, data_size = i + 8, csize
+                break
+            # chunks are word-aligned
+            i += 8 + csize + (csize & 1)
+        if data_off is None or not fmt or fmt.get("bits_per_sample") != 16:
+            return fmt
+        end = min(data_off + data_size, len(audio_bytes))
+        n = (end - data_off) // 2
+        if n <= 0:
+            return {**fmt, "samples": 0}
+        # peak/RMS over a sampled subset to keep it cheap on big files
+        step = max(1, n // 4096)
+        peak = 0
+        sq_sum = 0
+        count = 0
+        for k in range(0, n, step):
+            s = struct.unpack_from("<h", audio_bytes, data_off + 2 * k)[0]
+            a = -s if s < 0 else s
+            if a > peak:
+                peak = a
+            sq_sum += s * s
+            count += 1
+        rms = (sq_sum / count) ** 0.5 if count else 0.0
+        duration_s = n / fmt["sample_rate"] / fmt["channels"]
+        return {**fmt, "samples": n, "duration_s": round(duration_s, 2),
+                "peak_int16": peak, "rms_int16": round(rms, 1)}
+
     @observe(name="stt.azure", as_type="generation")
     async def transcribe(self, audio_content: str, lang: str = "en") -> str:
         import httpx
@@ -107,9 +157,10 @@ class AzureSTTProvider(TranscriptionProvider):
         recognition_lang = self._bcp47(lang)
         content_type = self._detect_content_type(audio_bytes)
         magic = audio_bytes[:8].hex()
+        wav_info = self._inspect_wav(audio_bytes)
         logger.info(
             f"Azure STT request: lang={recognition_lang}, bytes={len(audio_bytes)}, "
-            f"content_type={content_type}, magic={magic}"
+            f"content_type={content_type}, magic={magic}, wav={wav_info}"
         )
         update_current_observation(
             metadata={
