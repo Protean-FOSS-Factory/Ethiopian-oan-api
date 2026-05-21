@@ -5,6 +5,7 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # Install system dependencies
+# espeak-ng is required by Piper TTS (Amharic phonemization for Selam/Dawit/Meron voices).
 RUN apt-get update && apt-get install -y \
     supervisor \
     gcc \
@@ -12,6 +13,8 @@ RUN apt-get update && apt-get install -y \
     python3-dev \
     curl \
     netcat-openbsd \
+    espeak-ng \
+    espeak-ng-data \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better Docker layer caching
