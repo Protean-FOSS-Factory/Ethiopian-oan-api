@@ -187,3 +187,4 @@ cython_debug/
 .doc/
 .claude
 .vscode
+ONBOARDING.md

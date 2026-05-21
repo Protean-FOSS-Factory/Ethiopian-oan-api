@@ -60,6 +60,7 @@ torchaudio
 pipecat-ai[silero,rnnoise]
 onnxruntime
 pyrnnoise
+tritonclient[http]
 
 # Geocoding
 geopy

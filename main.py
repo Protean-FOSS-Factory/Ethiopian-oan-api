@@ -65,8 +65,7 @@ async def lifespan(app: FastAPI):
     try:
         from app.services.providers.tts import get_tts_provider
         tts = get_tts_provider()
-        await tts._load_model("en")
-        await tts._load_model("am")
+        await tts.preload(["en", "am"])
         logger.info("✅ TTS models pre-loaded (en, am)")
     except Exception as e:
         logger.warning(f"⚠️ TTS pre-load failed (will load on first request): {e}")
