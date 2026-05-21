@@ -128,10 +128,15 @@ OPENAI_TOOLS = [
 
 def _make_openai_client(async_mode: bool = True):
     """Create an OpenAI client pointed at the configured LLM backend."""
-    base_url = os.getenv("OPENAI_BASE_URL")
+    provider = os.getenv("LLM_PROVIDER", "ollama").lower()
+    if provider == "vllm":
+        base_url = os.getenv("TRITON_LLM_URL")
+        api_key = os.getenv("TRITON_LLM_API_KEY") or "vllm"
+    else:
+        base_url = os.getenv("OPENAI_BASE_URL")
+        api_key = os.getenv("OPENROUTER_API_KEY") or "ollama"
     if base_url and not base_url.rstrip('/').endswith('/v1'):
         base_url = base_url.rstrip('/') + '/v1'
-    api_key = os.getenv("OPENROUTER_API_KEY") or "ollama"
     if async_mode:
         return openai.AsyncOpenAI(base_url=base_url, api_key=api_key)
     return openai.OpenAI(base_url=base_url, api_key=api_key)
