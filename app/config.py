@@ -93,6 +93,18 @@ class Settings(BaseSettings):
     # RAG Configuration
     rag_provider: str = os.getenv("RAG_PROVIDER", "marqo")  # "marqo" or "cosdata"
 
+    # Intent Router Configuration
+    enable_intent_router: bool = os.getenv("ENABLE_INTENT_ROUTER", "true").lower() == "true"
+    intent_router_high_threshold: float = float(os.getenv("INTENT_ROUTER_HIGH_THRESHOLD", "0.8"))
+    intent_router_medium_threshold: float = float(os.getenv("INTENT_ROUTER_MEDIUM_THRESHOLD", "0.5"))
+    intent_router_session_ttl: int = int(os.getenv("INTENT_ROUTER_SESSION_TTL", "300"))
+
+    # STT Provider Configuration
+    stt_provider: str = os.getenv("STT_PROVIDER", "faster_whisper")  # "faster_whisper" | "omniasr" | "azure"
+    omniasr_url: str = os.getenv("OMNIASR_URL", "http://52.66.116.220:8080")
+    omniasr_model_name: str = os.getenv("OMNIASR_MODEL_NAME", "omniasr-amh")
+    omniasr_api_key: Optional[str] = os.getenv("OMNIASR_API_KEY")
+
     # Cosdata Configuration
     cosdata_endpoint_url: Optional[str] = os.getenv("COSDATA_ENDPOINT_URL")
     cosdata_api_key: Optional[str] = os.getenv("COSDATA_API_KEY")
