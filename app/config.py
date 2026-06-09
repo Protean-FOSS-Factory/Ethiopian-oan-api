@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     llm_provider: Optional[str] = None
     llm_model_name: Optional[str] = None
     marqo_index_name: Optional[str] = None
+    # Output-token cap reserved within the model's context window. Bounds latency/cost
+    # and prevents the tool loop from consuming the whole window (the "0 output tokens"
+    # rejection). Keep input + this value <= the server's --max-model-len.
+    llm_max_output_tokens: int = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "1024"))
 
     # RAG Configuration
     rag_provider: str = os.getenv("RAG_PROVIDER", "marqo")  # "marqo" or "cosdata"

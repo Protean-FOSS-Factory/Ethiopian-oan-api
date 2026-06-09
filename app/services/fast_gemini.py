@@ -17,6 +17,7 @@ from helpers.langfuse_client import (
 )
 openai = get_openai_module()
 from helpers.utils import get_logger, get_prompt, get_today_date_str
+from app.config import settings
 
 logger = get_logger(__name__)
 
@@ -266,6 +267,10 @@ class FastGeminiService:
                     messages=messages,
                     tools=OPENAI_TOOLS,
                     temperature=0.2,
+                    # Reserve output room within the model's context window so the
+                    # server never rejects with "0 output tokens" once the prompt +
+                    # RAG payload grows. Configurable via LLM_MAX_OUTPUT_TOKENS.
+                    max_tokens=settings.llm_max_output_tokens,
                     stream=True,
                 )
 
