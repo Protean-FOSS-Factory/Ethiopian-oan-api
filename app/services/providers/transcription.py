@@ -242,6 +242,92 @@ class FasterWhisperTranscriptionProvider(TranscriptionProvider):
             raise TranscriptionException(str(e))
 
 
+class OmniASRTranscriptionProvider(TranscriptionProvider):
+    """Transcription using OmniASR via Triton-compatible HTTP inference API.
+
+    Endpoint: POST {url}/v2/models/{model}/infer
+    Auth:     Bearer token via OMNIASR_API_KEY
+    Lang map: "am" -> "amh_Ethi", "en" -> "eng_Latn"
+    """
+
+    _LANG_MAP = {
+        "am": "amh_Ethi",
+        "en": "eng_Latn",
+        "amh_ethi": "amh_Ethi",
+        "eng_latn": "eng_Latn",
+    }
+
+    def __init__(self, base_url: str = None, model_name: str = None, api_key: str = None):
+        self.base_url = (base_url or os.getenv("OMNIASR_URL", "http://52.66.116.220:8080")).rstrip("/")
+        self.model_name = model_name or os.getenv("OMNIASR_MODEL_NAME", "omniasr-amh")
+        self.api_key = api_key or os.getenv("OMNIASR_API_KEY")
+        self.infer_url = f"{self.base_url}/v2/models/{self.model_name}/infer"
+        logger.info(f"✅ OmniASR Transcription Provider initialized: {self.infer_url}")
+
+    def _triton_lang(self, lang: str) -> str:
+        return self._LANG_MAP.get(lang.lower(), "amh_Ethi")
+
+    def validate_audio(self, audio_content: str) -> bytes:
+        if not audio_content:
+            raise InvalidAudioException("Audio content is empty")
+        try:
+            audio_bytes = base64.b64decode(audio_content)
+            if len(audio_bytes) > 50 * 1024 * 1024:
+                raise InvalidAudioException("Audio too large (max 50MB)")
+            if len(audio_bytes) < 100:
+                raise InvalidAudioException("Audio data too short")
+            return audio_bytes
+        except base64.binascii.Error as e:
+            raise InvalidAudioException(f"Invalid base64 audio data: {e}")
+
+    @observe(name="stt.omniasr", as_type="generation")
+    async def transcribe(self, audio_content: str, lang: str = "am") -> str:
+        import httpx
+        audio_bytes = self.validate_audio(audio_content)
+        triton_lang = self._triton_lang(lang)
+
+        update_current_observation(
+            metadata={"provider": "omniasr", "lang": triton_lang, "audio_bytes": len(audio_bytes)},
+        )
+
+        payload = {
+            "inputs": [
+                {
+                    "name": "audio_bytes",
+                    "datatype": "BYTES",
+                    "shape": [1],
+                    "data": [base64.b64encode(audio_bytes).decode()],
+                },
+                {
+                    "name": "language",
+                    "datatype": "STRING",
+                    "shape": [1],
+                    "data": [triton_lang],
+                },
+            ]
+        }
+
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(self.infer_url, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                outputs = data.get("outputs", [])
+                transcript_out = next((o for o in outputs if o.get("name") == "transcript"), None)
+                text = (transcript_out["data"][0] if transcript_out and transcript_out.get("data") else "").strip()
+                logger.info(f"Transcription (omniasr): '{text[:50]}'")
+                update_current_observation(output=text)
+                return text
+        except httpx.HTTPStatusError as e:
+            raise TranscriptionException(f"OmniASR HTTP {e.response.status_code}: {e.response.text}")
+        except Exception as e:
+            raise TranscriptionException(str(e))
+
+
 # Singleton instance - initialized once at startup
 _transcription_provider: Optional[TranscriptionProvider] = None
 
@@ -258,6 +344,8 @@ def get_transcription_provider() -> TranscriptionProvider:
         provider_name = os.getenv("STT_PROVIDER", "faster_whisper").strip().lower()
         if provider_name == "azure":
             _transcription_provider = AzureSTTProvider()
+        elif provider_name == "omniasr":
+            _transcription_provider = OmniASRTranscriptionProvider()
         else:
             _transcription_provider = FasterWhisperTranscriptionProvider()
     return _transcription_provider

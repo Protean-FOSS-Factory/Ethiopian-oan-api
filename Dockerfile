@@ -38,9 +38,9 @@ COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 # Expose FastAPI port
 EXPOSE 8000
 
-# Copy entrypoint script
-COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
+# Copy entrypoint script outside /app so the volume mount doesn't overwrite it
+COPY docker-entrypoint.sh /entrypoint.sh
+RUN sed -i 's/\r//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Start with entrypoint script
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
+ENTRYPOINT ["/entrypoint.sh"]
